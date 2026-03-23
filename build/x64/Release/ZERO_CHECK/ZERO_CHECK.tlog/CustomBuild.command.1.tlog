@@ -1,0 +1,10 @@
+^E:\GRAM_NEXT\BUILD\CMAKEFILES\47A8D77CA95254174697E1F9DD3CB77E\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SE:/gram_next -BE:/gram_next/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/gram_next/build/gram_repro.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

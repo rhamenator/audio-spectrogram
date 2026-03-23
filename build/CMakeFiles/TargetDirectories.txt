@@ -1,0 +1,6 @@
+E:/gram_next/build/CMakeFiles/gram_core.dir
+E:/gram_next/build/CMakeFiles/gram_repro.dir
+E:/gram_next/build/CMakeFiles/gram_live.dir
+E:/gram_next/build/CMakeFiles/gram_audio_info.dir
+E:/gram_next/build/CMakeFiles/ALL_BUILD.dir
+E:/gram_next/build/CMakeFiles/ZERO_CHECK.dir
