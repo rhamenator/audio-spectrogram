@@ -1,6 +1,6 @@
-# gram_next
+# audio-spectrogram
 
-`gram_next` is the new standalone evolution of the clean-room reimplementation work for
+`audio-spectrogram` is the new standalone evolution of the clean-room reimplementation work for
 the legacy `gram.exe` / `Spectrogram 5.1.7.0` tool.
 
 The project now has two fronts on top of a shared DSP core:
@@ -56,8 +56,8 @@ cleanly so we can later:
 ## Build
 
 ```powershell
-cmake -S E:\gram_next -B E:\gram_next\build
-cmake --build E:\gram_next\build --config Release
+cmake -S E:\audio-spectrogram -B E:\audio-spectrogram\build
+cmake --build E:\audio-spectrogram\build --config Release
 ```
 
 ## Usage
@@ -65,13 +65,13 @@ cmake --build E:\gram_next\build --config Release
 CLI:
 
 ```powershell
-E:\gram_next\build\Release\gram_repro.exe input.wav output.ppm --profile
+E:\audio-spectrogram\build\Release\gram_repro.exe input.wav output.ppm --profile
 ```
 
 Live app:
 
 ```powershell
-E:\gram_next\build\Release\gram_live.exe
+E:\audio-spectrogram\build\Release\gram_live.exe
 ```
 
 The live app listens to the default multimedia output endpoint, not to any single app window.
@@ -79,7 +79,7 @@ The live app listens to the default multimedia output endpoint, not to any singl
 Example with explicit options:
 
 ```powershell
-E:\gram_next\build\Release\gram_repro.exe `
+E:\audio-spectrogram\build\Release\gram_repro.exe `
   input.wav output.ppm `
   --fft 2048 `
   --hop 256 `
