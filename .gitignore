@@ -34,3 +34,6 @@
 # CMake build directories
 build/
 build-fresh/
+
+# Claude permissions settings
+.claude/
