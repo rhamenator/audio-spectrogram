@@ -8,7 +8,9 @@
 #include <functiondiscoverykeys_devpkey.h>
 
 #include <algorithm>
+#include <cstring>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -17,6 +19,13 @@ namespace {
 
 constexpr int kEditId = 2001;
 constexpr int kOkId = 2002;
+constexpr wchar_t kInfoToolName[] = L"audio-spectrogram-info";
+
+struct DefaultEndpointSummary {
+    std::wstring role;
+    std::wstring name;
+    std::wstring kind;
+};
 
 template <typename T>
 void safe_release(T*& value) {
@@ -95,6 +104,35 @@ std::wstring read_friendly_name(IMMDevice* device) {
     return text;
 }
 
+std::wstring lower_copy(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t value) {
+        return static_cast<wchar_t>(towlower(value));
+    });
+    return text;
+}
+
+std::wstring endpoint_kind_text(const std::wstring& friendly_name) {
+    const std::wstring lower = lower_copy(friendly_name);
+    if (lower.find(L"fxsound") != std::wstring::npos ||
+        lower.find(L"enhancer") != std::wstring::npos ||
+        lower.find(L"virtual") != std::wstring::npos ||
+        lower.find(L"voicemeeter") != std::wstring::npos ||
+        lower.find(L"vb-audio") != std::wstring::npos ||
+        lower.find(L"sonar") != std::wstring::npos ||
+        lower.find(L"apo") != std::wstring::npos) {
+        return L"virtual/processed";
+    }
+    if (lower.find(L"realtek") != std::wstring::npos ||
+        lower.find(L"usb") != std::wstring::npos ||
+        lower.find(L"display audio") != std::wstring::npos ||
+        lower.find(L"headphones") != std::wstring::npos ||
+        lower.find(L"speakers") != std::wstring::npos ||
+        lower.find(L"hdmi") != std::wstring::npos) {
+        return L"hardware-backed";
+    }
+    return L"unknown";
+}
+
 std::wstring wave_format_text(const WAVEFORMATEX* format) {
     if (format == nullptr) {
         return L"(none)";
@@ -107,24 +145,61 @@ std::wstring wave_format_text(const WAVEFORMATEX* format) {
     return stream.str();
 }
 
-std::wstring sample_rate_support_report(IAudioClient* client, const WAVEFORMATEX* base_format) {
-    if (client == nullptr || base_format == nullptr) {
+std::vector<BYTE> clone_wave_format_blob(const WAVEFORMATEX* format) {
+    if (format == nullptr) {
+        return {};
+    }
+    const std::size_t size = sizeof(WAVEFORMATEX) + static_cast<std::size_t>(format->cbSize);
+    std::vector<BYTE> blob(size);
+    std::memcpy(blob.data(), format, size);
+    return blob;
+}
+
+std::wstring initialize_probe(IMMDevice* device, const WAVEFORMATEX* format) {
+    if (device == nullptr || format == nullptr) {
+        return L"";
+    }
+    IAudioClient* probe_client = nullptr;
+    const HRESULT activate = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&probe_client));
+    if (FAILED(activate)) {
+        return L", init " + format_hresult(activate);
+    }
+    const HRESULT init = probe_client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        0,
+        10000000,
+        0,
+        format,
+        nullptr);
+    safe_release(probe_client);
+    if (SUCCEEDED(init)) {
+        return L", init ok";
+    }
+    return L", init " + format_hresult(init);
+}
+
+std::wstring sample_rate_support_report(IAudioClient* client, IMMDevice* device, const WAVEFORMATEX* base_format) {
+    if (client == nullptr || device == nullptr || base_format == nullptr) {
         return L"  Shared-mode rates: unavailable\n";
     }
 
     const int rates[] = { 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 192000 };
     std::wostringstream stream;
-    stream << L"  Shared-mode exact support:";
+    stream << L"  Shared-mode support:";
     for (int rate : rates) {
-        WAVEFORMATEX probe = *base_format;
-        probe.nSamplesPerSec = static_cast<DWORD>(rate);
-        probe.nAvgBytesPerSec = probe.nSamplesPerSec * probe.nBlockAlign;
+        std::vector<BYTE> probe_blob = clone_wave_format_blob(base_format);
+        auto* probe = reinterpret_cast<WAVEFORMATEX*>(probe_blob.data());
+        probe->nSamplesPerSec = static_cast<DWORD>(rate);
+        probe->nAvgBytesPerSec = probe->nSamplesPerSec * probe->nBlockAlign;
         WAVEFORMATEX* closest = nullptr;
-        const HRESULT hr = client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &probe, &closest);
+        const HRESULT hr = client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, probe, &closest);
         if (hr == S_OK) {
-            stream << L"\n    " << rate << L" Hz: exact";
+            stream << L"\n    " << rate << L" Hz: exact" << initialize_probe(device, probe);
         } else if (hr == S_FALSE) {
             stream << L"\n    " << rate << L" Hz: closest available";
+            if (closest != nullptr) {
+                stream << L" -> " << wave_format_text(closest);
+            }
         } else {
             stream << L"\n    " << rate << L" Hz: no (" << format_hresult(hr) << L")";
         }
@@ -136,14 +211,19 @@ std::wstring sample_rate_support_report(IAudioClient* client, const WAVEFORMATEX
     return stream.str();
 }
 
-void append_endpoint_report(std::wostringstream& output, IMMDevice* device, const wchar_t* role_label, bool is_default) {
+DefaultEndpointSummary append_endpoint_report(std::wostringstream& output, IMMDevice* device, const wchar_t* role_label, bool is_default) {
     wchar_t* id = nullptr;
     DWORD state = 0;
     IAudioClient* client = nullptr;
     WAVEFORMATEX* mix = nullptr;
+    DefaultEndpointSummary summary;
+    summary.role = role_label;
 
     output << role_label << (is_default ? L" (default)" : L"") << L"\n";
-    output << L"  Name: " << read_friendly_name(device) << L"\n";
+    summary.name = read_friendly_name(device);
+    summary.kind = endpoint_kind_text(summary.name);
+    output << L"  Name: " << summary.name << L"\n";
+    output << L"  Path kind: " << summary.kind << L"\n";
 
     if (SUCCEEDED(device->GetId(&id)) && id != nullptr) {
         output << L"  Id: " << id << L"\n";
@@ -159,7 +239,7 @@ void append_endpoint_report(std::wostringstream& output, IMMDevice* device, cons
             CoTaskMemFree(id);
         }
         safe_release(client);
-        return;
+        return summary;
     }
 
     const HRESULT mix_result = client->GetMixFormat(&mix);
@@ -179,7 +259,7 @@ void append_endpoint_report(std::wostringstream& output, IMMDevice* device, cons
         output << L"  Device period: " << format_hresult(period_result) << L"\n";
     }
 
-    output << sample_rate_support_report(client, mix);
+    output << sample_rate_support_report(client, device, mix);
     output << L"\n";
 
     if (mix != nullptr) {
@@ -189,11 +269,12 @@ void append_endpoint_report(std::wostringstream& output, IMMDevice* device, cons
         CoTaskMemFree(id);
     }
     safe_release(client);
+    return summary;
 }
 
 std::wstring build_report() {
     std::wostringstream output;
-    output << L"gram_audio_info\n";
+    output << kInfoToolName << L"\n";
     output << L"Windows audio endpoint report\n\n";
 
     const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -220,15 +301,28 @@ std::wstring build_report() {
 
     const ERole roles[] = { eConsole, eMultimedia, eCommunications };
     const wchar_t* role_names[] = { L"Default console render", L"Default multimedia render", L"Default communications render" };
+    std::vector<DefaultEndpointSummary> defaults;
     for (int index = 0; index < 3; ++index) {
         IMMDevice* device = nullptr;
         const HRESULT hr = enumerator->GetDefaultAudioEndpoint(eRender, roles[index], &device);
         if (SUCCEEDED(hr) && device != nullptr) {
-            append_endpoint_report(output, device, role_names[index], true);
+            defaults.push_back(append_endpoint_report(output, device, role_names[index], true));
         } else {
             output << role_names[index] << L"\n  Error: " << format_hresult(hr) << L"\n\n";
         }
         safe_release(device);
+    }
+
+    if (!defaults.empty()) {
+        output << L"Default endpoint summary\n";
+        for (const auto& item : defaults) {
+            output << L"  " << item.role << L": " << item.name;
+            if (!item.kind.empty()) {
+                output << L" [" << item.kind << L"]";
+            }
+            output << L"\n";
+        }
+        output << L"\n";
     }
 
     IMMDeviceCollection* collection = nullptr;
@@ -280,7 +374,7 @@ public:
         hwnd_ = CreateWindowExW(
             0,
             window_class.lpszClassName,
-            L"gram_audio_info",
+            kInfoToolName,
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -387,7 +481,7 @@ private:
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     AudioInfoWindow app;
     if (!app.create(instance, show)) {
-        MessageBoxW(nullptr, L"Unable to create the audio info window.", L"gram_audio_info", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Unable to create the audio info window.", kInfoToolName, MB_ICONERROR);
         return 1;
     }
 

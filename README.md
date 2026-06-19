@@ -1,12 +1,12 @@
 # audio-spectrogram
 
-`audio-spectrogram` is the new standalone evolution of the clean-room reimplementation work for
+`audio-spectrogram` is the standalone evolution of the clean-room reimplementation work for
 the legacy `gram.exe` / `Spectrogram 5.1.7.0` tool.
 
 The project now has two fronts on top of a shared DSP core:
 
-- `gram_repro`: file-based CLI spectrogram export
-- `gram_live`: Win32 default-output loopback capture/playback with a scrolling spectrogram
+- `audio-spectrogram-cli`: file-based CLI spectrogram export
+- `audio-spectrogram`: Win32 default-output loopback capture/playback with a scrolling spectrogram
 
 Current capabilities:
 
@@ -26,7 +26,7 @@ Current capabilities:
 - Adjust display sensitivity from a single top-row slider with auto-ranging
 - Show capture/source status in a bottom status bar instead of truncating it in the header
 - Show current media metadata in the status bar when Windows exposes it
-- Write crash/apply/capture diagnostics to `gram_live.log` beside the executable
+- Write crash/apply/capture diagnostics to `audio-spectrogram.log` beside the executable
 - Show frequency scales on both sides of the live graph
 - Switch between a scrolling spectrogram and an instantaneous spectrum view
 - Switch between mono, stereo, and automatic channel display handling
@@ -41,7 +41,8 @@ Current capabilities:
 - Add note-name guides, peak labels, harmonic hints, chord hints, and transient markers
 - Toggle the musical note grid and beat/transient markers separately from the main graph grid
 - Show tuner-specific instrument controls in the live window without duplicating the main transport buttons
-- Include a separate `gram_audio_info` utility for inspecting Windows render-endpoint capabilities
+- Include a separate `audio-spectrogram-info` utility for inspecting Windows render-endpoint capabilities
+- Include `tools/query-audio-output.ps1` for a console-side PowerShell dump of the current output-device stack
 
 ## Why C++ first
 
@@ -56,8 +57,8 @@ cleanly so we can later:
 ## Build
 
 ```powershell
-cmake -S E:\audio-spectrogram -B E:\audio-spectrogram\build
-cmake --build E:\audio-spectrogram\build --config Release
+cmake -S E:\audio-spectrogram -B E:\audio-spectrogram\build-fresh
+cmake --build E:\audio-spectrogram\build-fresh --config Release
 ```
 
 ## Usage
@@ -65,13 +66,19 @@ cmake --build E:\audio-spectrogram\build --config Release
 CLI:
 
 ```powershell
-E:\audio-spectrogram\build\Release\gram_repro.exe input.wav output.ppm --profile
+E:\audio-spectrogram\build-fresh\Release\audio-spectrogram-cli.exe input.wav output.ppm --profile
 ```
 
 Live app:
 
 ```powershell
-E:\audio-spectrogram\build\Release\gram_live.exe
+E:\audio-spectrogram\build-fresh\Release\audio-spectrogram.exe
+```
+
+PowerShell device report:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File E:\audio-spectrogram\tools\query-audio-output.ps1
 ```
 
 The live app listens to the default multimedia output endpoint, not to any single app window.
@@ -79,7 +86,7 @@ The live app listens to the default multimedia output endpoint, not to any singl
 Example with explicit options:
 
 ```powershell
-E:\audio-spectrogram\build\Release\gram_repro.exe `
+E:\audio-spectrogram\build-fresh\Release\audio-spectrogram-cli.exe `
   input.wav output.ppm `
   --fft 2048 `
   --hop 256 `

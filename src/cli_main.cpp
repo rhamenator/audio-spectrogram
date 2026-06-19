@@ -93,7 +93,7 @@ gram::FrequencyScale parse_scale(std::string_view value) {
 void print_usage() {
     std::cout
         << "Usage:\n"
-        << "  gram_repro <input.wav> <output.ppm> [options]\n\n"
+        << "  audio-spectrogram-cli <input.wav> <output.ppm> [options]\n\n"
         << "Options:\n"
         << "  --fft <n>         FFT size, power of two (default: 2048)\n"
         << "  --hop <n>         Hop size in samples (default: 512)\n"
@@ -214,7 +214,7 @@ int main(int argc, char** argv) {
 
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "gram_repro: " << error.what() << '\n';
+        std::cerr << "audio-spectrogram-cli: " << error.what() << '\n';
         return 1;
     }
 }

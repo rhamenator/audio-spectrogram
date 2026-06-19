@@ -12,10 +12,12 @@
 #include <audioclient.h>
 #include <mmreg.h>
 #include <wincodec.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -24,6 +26,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -44,6 +48,8 @@ constexpr int kButtonHeight = 28;
 constexpr double kAnalysisFloorDb = -180.0;
 constexpr double kPeakHoldDecayDbPerFrame = 0.18;
 constexpr double kAverageBlendAlpha = 0.16;
+constexpr wchar_t kLiveAppName[] = L"audio-spectrogram";
+constexpr wchar_t kLiveAppWindowTitle[] = L"audio-spectrogram";
 
 enum ControlId : int {
     StartButton = 1001,
@@ -81,6 +87,7 @@ enum ControlId : int {
     InstrumentCombo = 1120,
     TunerStartButton = 1121,
     TunerStopButton = 1122,
+    MusicModeCheck = 1123,
 };
 
 enum class DisplayMode {
@@ -113,12 +120,14 @@ struct SpectrumPeak {
     double level_db = -180.0;
     int midi_note = 0;
     double cents = 0.0;
+    double confidence = 0.0;
 };
 
 struct MusicStatusFields {
     std::wstring pitch;
     std::wstring cents;
     std::wstring chord;
+    std::wstring confidence;
 };
 
 template <typename T>
@@ -157,6 +166,171 @@ std::string narrow_system_path(const wchar_t* text) {
     std::string narrow(static_cast<std::size_t>(count - 1), '\0');
     WideCharToMultiByte(CP_ACP, 0, text, -1, narrow.data(), count, nullptr, nullptr);
     return narrow;
+}
+
+std::wstring read_device_friendly_name(IMMDevice* device) {
+    if (device == nullptr) {
+        return L"";
+    }
+    IPropertyStore* store = nullptr;
+    PROPVARIANT value {};
+    PropVariantInit(&value);
+    std::wstring text;
+    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store))) {
+        if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &value)) && value.vt == VT_LPWSTR && value.pwszVal != nullptr) {
+            text = value.pwszVal;
+        }
+    }
+    PropVariantClear(&value);
+    safe_release(store);
+    return text;
+}
+
+std::wstring read_device_id(IMMDevice* device) {
+    if (device == nullptr) {
+        return L"";
+    }
+    wchar_t* id = nullptr;
+    std::wstring text;
+    if (SUCCEEDED(device->GetId(&id)) && id != nullptr) {
+        text = id;
+        CoTaskMemFree(id);
+    }
+    return text;
+}
+
+std::wstring lower_copy(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t value) {
+        return static_cast<wchar_t>(towlower(value));
+    });
+    return text;
+}
+
+std::wstring endpoint_kind_text(const std::wstring& friendly_name) {
+    const std::wstring lower = lower_copy(friendly_name);
+    if (lower.find(L"fxsound") != std::wstring::npos ||
+        lower.find(L"enhancer") != std::wstring::npos ||
+        lower.find(L"virtual") != std::wstring::npos ||
+        lower.find(L"voicemeeter") != std::wstring::npos ||
+        lower.find(L"vb-audio") != std::wstring::npos ||
+        lower.find(L"sonar") != std::wstring::npos ||
+        lower.find(L"apo") != std::wstring::npos) {
+        return L"virtual/processed";
+    }
+    if (lower.find(L"realtek") != std::wstring::npos ||
+        lower.find(L"usb") != std::wstring::npos ||
+        lower.find(L"display audio") != std::wstring::npos ||
+        lower.find(L"headphones") != std::wstring::npos ||
+        lower.find(L"speakers") != std::wstring::npos ||
+        lower.find(L"hdmi") != std::wstring::npos) {
+        return L"hardware-backed";
+    }
+    return L"unknown";
+}
+
+std::wstring wave_format_text(const WAVEFORMATEX* format) {
+    if (format == nullptr) {
+        return L"(none)";
+    }
+    std::wostringstream stream;
+    stream << format->nSamplesPerSec << L" Hz, "
+           << format->nChannels << L" ch, "
+           << format->wBitsPerSample << L" bit, tag 0x"
+           << std::hex << std::uppercase << format->wFormatTag;
+    if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+        const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
+        wchar_t guid_text[64] {};
+        StringFromGUID2(extensible->SubFormat, guid_text, static_cast<int>(std::size(guid_text)));
+        stream << std::dec
+               << L", valid " << extensible->Samples.wValidBitsPerSample
+               << L", mask 0x" << std::hex << std::uppercase << extensible->dwChannelMask
+               << std::dec << L", subformat " << guid_text;
+    }
+    return stream.str();
+}
+
+double sanitize_audio_sample(double value) {
+    if (!std::isfinite(value)) {
+        return 0.0;
+    }
+    return std::clamp(value, -1.0, 1.0);
+}
+
+std::vector<BYTE> clone_wave_format_blob(const WAVEFORMATEX* format) {
+    if (format == nullptr) {
+        return {};
+    }
+    const std::size_t size = sizeof(WAVEFORMATEX) + static_cast<std::size_t>(format->cbSize);
+    std::vector<BYTE> blob(size);
+    std::memcpy(blob.data(), format, size);
+    return blob;
+}
+
+std::vector<int> probe_supported_analysis_rates() {
+    static const int candidate_rates[] = { 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000 };
+    std::vector<int> supported;
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IAudioClient* client = nullptr;
+    WAVEFORMATEX* mix_format = nullptr;
+
+    const HRESULT create_enumerator = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        nullptr,
+        CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(&enumerator));
+    if (FAILED(create_enumerator)) {
+        return { 48000 };
+    }
+
+    const HRESULT default_endpoint = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+    if (FAILED(default_endpoint)) {
+        safe_release(enumerator);
+        return { 48000 };
+    }
+
+    const HRESULT activate = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
+    if (FAILED(activate)) {
+        safe_release(device);
+        safe_release(enumerator);
+        return { 48000 };
+    }
+
+    const HRESULT mix_result = client->GetMixFormat(&mix_format);
+    if (SUCCEEDED(mix_result) && mix_format != nullptr) {
+        const int mix_rate = static_cast<int>(mix_format->nSamplesPerSec);
+        for (const int rate : candidate_rates) {
+            std::vector<BYTE> blob = clone_wave_format_blob(mix_format);
+            auto* probe = reinterpret_cast<WAVEFORMATEX*>(blob.data());
+            probe->nSamplesPerSec = static_cast<DWORD>(rate);
+            probe->nAvgBytesPerSec = probe->nSamplesPerSec * probe->nBlockAlign;
+            WAVEFORMATEX* closest = nullptr;
+            const HRESULT support = client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, probe, &closest);
+            if (support == S_OK) {
+                supported.push_back(rate);
+            }
+            if (closest != nullptr) {
+                CoTaskMemFree(closest);
+            }
+        }
+        if (supported.empty() && mix_rate > 0) {
+            supported.push_back(mix_rate);
+        }
+    }
+
+    if (mix_format != nullptr) {
+        CoTaskMemFree(mix_format);
+    }
+    safe_release(client);
+    safe_release(device);
+    safe_release(enumerator);
+
+    if (supported.empty()) {
+        supported.push_back(48000);
+    }
+    return supported;
 }
 
 bool is_float_format(const WAVEFORMATEX* format) {
@@ -296,7 +470,7 @@ std::wstring module_directory() {
 }
 
 std::wstring live_log_path() {
-    return module_directory() + L"\\gram_live.log";
+    return module_directory() + L"\\audio-spectrogram.log";
 }
 
 std::wstring format_hresult(HRESULT value) {
@@ -348,7 +522,7 @@ void append_live_log(const std::wstring& context, const std::wstring& message) {
 void show_logged_error(HWND hwnd, const std::wstring& context, const std::wstring& message) {
     append_live_log(context, message);
     std::wstring dialog = message + L"\n\nSee " + live_log_path();
-    MessageBoxW(hwnd, dialog.c_str(), L"gram_live", MB_ICONERROR);
+    MessageBoxW(hwnd, dialog.c_str(), kLiveAppName, MB_ICONERROR);
 }
 
 void show_logged_hresult(HWND hwnd, const std::wstring& context, const std::wstring& message, HRESULT value) {
@@ -406,6 +580,43 @@ std::wstring pitch_class_name(int midi_note) {
     return names[((midi_note % 12) + 12) % 12];
 }
 
+int midi_from_note_name(const std::wstring& note_name) {
+    if (note_name.empty()) {
+        return -1;
+    }
+
+    int semitone = -1;
+    switch (towupper(note_name[0])) {
+    case L'C': semitone = 0; break;
+    case L'D': semitone = 2; break;
+    case L'E': semitone = 4; break;
+    case L'F': semitone = 5; break;
+    case L'G': semitone = 7; break;
+    case L'A': semitone = 9; break;
+    case L'B': semitone = 11; break;
+    default:
+        return -1;
+    }
+
+    std::size_t index = 1;
+    if (index < note_name.size()) {
+        if (note_name[index] == L'#') {
+            ++semitone;
+            ++index;
+        } else if (note_name[index] == L'b') {
+            --semitone;
+            ++index;
+        }
+    }
+
+    if (index >= note_name.size()) {
+        return -1;
+    }
+
+    const int octave = std::stoi(note_name.substr(index));
+    return (octave + 1) * 12 + ((semitone % 12) + 12) % 12;
+}
+
 std::wstring chord_hint_from_midis(const std::vector<int>& midis) {
     if (midis.size() < 2) {
         return L"";
@@ -434,6 +645,48 @@ std::wstring chord_hint_from_midis(const std::vector<int>& midis) {
     return L"";
 }
 
+std::wstring chord_hint_from_chroma(const std::array<double, 12>& chroma) {
+    double peak = 0.0;
+    for (const double value : chroma) {
+        peak = (std::max)(peak, value);
+    }
+    if (peak <= 0.0) {
+        return L"";
+    }
+
+    bool present[12] {};
+    for (int index = 0; index < 12; ++index) {
+        present[index] = chroma[index] >= peak * 0.52;
+    }
+
+    for (int root = 0; root < 12; ++root) {
+        if (!present[root]) {
+            continue;
+        }
+        const bool minor = present[(root + 3) % 12] && present[(root + 7) % 12];
+        const bool major = present[(root + 4) % 12] && present[(root + 7) % 12];
+        const bool power = present[(root + 7) % 12];
+        const bool sus2 = present[(root + 2) % 12] && present[(root + 7) % 12];
+        const bool sus4 = present[(root + 5) % 12] && present[(root + 7) % 12];
+        if (major) {
+            return pitch_class_name(root) + L" major";
+        }
+        if (minor) {
+            return pitch_class_name(root) + L" minor";
+        }
+        if (sus2) {
+            return pitch_class_name(root) + L" sus2";
+        }
+        if (sus4) {
+            return pitch_class_name(root) + L" sus4";
+        }
+        if (power) {
+            return pitch_class_name(root) + L"5";
+        }
+    }
+    return L"";
+}
+
 LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* exception) {
     std::wostringstream message;
     message << L"Unhandled exception";
@@ -444,20 +697,21 @@ LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* exception) {
     }
     append_live_log(L"unhandled_exception", message.str());
     std::wstring dialog = message.str() + L"\n\nSee " + live_log_path();
-    MessageBoxW(nullptr, dialog.c_str(), L"gram_live", MB_ICONERROR);
+    MessageBoxW(nullptr, dialog.c_str(), kLiveAppName, MB_ICONERROR);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
 [[noreturn]] void terminate_handler() {
-    append_live_log(L"terminate", L"gram_live terminated unexpectedly.");
-    std::wstring dialog = L"gram_live terminated unexpectedly.\n\nSee " + live_log_path();
-    MessageBoxW(nullptr, dialog.c_str(), L"gram_live", MB_ICONERROR);
+    append_live_log(L"terminate", L"audio-spectrogram terminated unexpectedly.");
+    std::wstring dialog = L"audio-spectrogram terminated unexpectedly.\n\nSee " + live_log_path();
+    MessageBoxW(nullptr, dialog.c_str(), kLiveAppName, MB_ICONERROR);
     std::abort();
 }
 
 class LiveApp;
 
 void apply_settings_with_diagnostics(LiveApp* app);
+DWORD try_consume_loopback_packets(LiveApp* app);
 
 class LiveApp {
 public:
@@ -465,6 +719,7 @@ public:
     bool create(HINSTANCE instance, int show);
 
     friend void apply_settings_with_diagnostics(LiveApp* app);
+    friend DWORD try_consume_loopback_packets(LiveApp* app);
 
 private:
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -498,6 +753,11 @@ private:
     void load_preset();
     void save_note_csv();
     [[nodiscard]] std::vector<std::wstring> active_instrument_notes() const;
+    [[nodiscard]] const std::vector<std::int16_t>& selected_tuner_samples() const;
+    [[nodiscard]] std::vector<double> instrument_target_frequencies() const;
+    [[nodiscard]] int tuner_reference_midi(double frequency) const;
+    [[nodiscard]] std::optional<SpectrumPeak> estimate_tuner_pitch() const;
+    void update_music_analysis_frame(double rms, bool transient);
 
     void update_status();
     void update_level_labels();
@@ -592,6 +852,7 @@ private:
     HWND scroll_speed_combo_ = nullptr;
     HWND music_grid_check_ = nullptr;
     HWND beat_marks_check_ = nullptr;
+    HWND music_mode_check_ = nullptr;
     HWND instrument_label_ = nullptr;
     HWND instrument_combo_ = nullptr;
     HWND tuner_start_button_ = nullptr;
@@ -663,6 +924,7 @@ private:
     bool show_grid_ = true;
     bool show_note_guides_ = false;
     bool show_beat_marks_ = false;
+    bool music_mode_enabled_ = true;
     bool show_peak_hold_ = true;
     bool show_average_ = true;
     bool freeze_display_ = false;
@@ -684,15 +946,27 @@ private:
     bool marker_out_set_ = false;
     std::size_t cursor_sample_index_ = 0;
     std::vector<std::size_t> transient_markers_;
+    std::array<double, 12> music_chroma_smooth_ {};
+    std::vector<double> previous_music_bins_;
+    double music_frequency_ = 0.0;
+    double music_cents_ = 0.0;
+    double music_confidence_ = 0.0;
+    double music_vibrato_cents_ = 0.0;
+    int music_midi_note_ = 0;
+    std::wstring music_chord_hint_;
+    bool music_analysis_ready_ = false;
     double last_frame_rms_ = 0.0;
     double stereo_correlation_ = 0.0;
     bool reference_available_ = false;
     std::wstring instrument_mode_ = L"chromatic";
 
     std::wstring status_text_ = L"Idle";
+    std::wstring active_source_text_ = L"default output loopback";
     std::wstring now_playing_text_;
     std::wstring cursor_text_ = L"Cursor: off";
     std::vector<int> available_sample_rates_ { 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000 };
+    int capture_packet_log_count_ = 0;
+    int capture_nonfinite_log_count_ = 0;
 };
 
 void apply_settings_with_diagnostics(LiveApp* app) {
@@ -726,6 +1000,15 @@ LiveApp::~LiveApp() {
     }
 }
 
+DWORD try_consume_loopback_packets(LiveApp* app) {
+    __try {
+        app->consume_loopback_packets();
+        return 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 1;
+    }
+}
+
 bool LiveApp::create(HINSTANCE instance, int show) {
     SetUnhandledExceptionFilter(&unhandled_exception_filter);
     std::set_terminate(&terminate_handler);
@@ -742,6 +1025,17 @@ bool LiveApp::create(HINSTANCE instance, int show) {
     }
     com_initialized_ = true;
     winrt::init_apartment(winrt::apartment_type::single_threaded);
+    available_sample_rates_ = probe_supported_analysis_rates();
+    {
+        std::wostringstream supported;
+        for (std::size_t index = 0; index < available_sample_rates_.size(); ++index) {
+            if (index > 0) {
+                supported << L",";
+            }
+            supported << available_sample_rates_[index];
+        }
+        append_live_log(L"supported_rates", supported.str());
+    }
 
     INITCOMMONCONTROLSEX controls {};
     controls.dwSize = sizeof(controls);
@@ -764,7 +1058,7 @@ bool LiveApp::create(HINSTANCE instance, int show) {
     hwnd_ = CreateWindowExW(
         0,
         class_name,
-        L"gram_next - Live Music Analyzer",
+            kLiveAppWindowTitle,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -946,13 +1240,21 @@ LRESULT LiveApp::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             show_average_ = SendMessageW(average_check_, BM_GETCHECK, 0, 0) == BST_CHECKED;
             graph_dirty_ = true;
             update_status();
+        } else if (id == MusicModeCheck && code == BN_CLICKED) {
+            music_mode_enabled_ = SendMessageW(music_mode_check_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            graph_dirty_ = true;
+            update_status();
         }
         return 0;
     }
 
     case WM_TIMER: {
         if (wparam == kPollTimer && capturing_) {
-            consume_loopback_packets();
+            const DWORD exception_code = try_consume_loopback_packets(this);
+            if (exception_code != 0) {
+                show_logged_error(hwnd_, L"wm_timer.capture", L"Structured exception in consume_loopback_packets.");
+                stop_capture();
+            }
         }
         const ULONGLONG now = GetTickCount64();
         if (now >= next_auto_level_tick_) {
@@ -1093,6 +1395,8 @@ void LiveApp::create_controls() {
         0, 0, 92, 22, hwnd_, reinterpret_cast<HMENU>(MusicGridCheck), nullptr, nullptr);
     beat_marks_check_ = CreateWindowExW(0, L"BUTTON", L"Beat Marks", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
         0, 0, 92, 22, hwnd_, reinterpret_cast<HMENU>(BeatMarksCheck), nullptr, nullptr);
+    music_mode_check_ = CreateWindowExW(0, L"BUTTON", L"Music Mode", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        0, 0, 96, 22, hwnd_, reinterpret_cast<HMENU>(MusicModeCheck), nullptr, nullptr);
     instrument_label_ = CreateWindowExW(0, L"STATIC", L"Instrument", WS_CHILD | WS_VISIBLE, 0, 0, 70, 18, hwnd_, nullptr, nullptr, nullptr);
     instrument_combo_ = CreateWindowExW(0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
         0, 0, 140, 220, hwnd_, reinterpret_cast<HMENU>(InstrumentCombo), nullptr, nullptr);
@@ -1105,6 +1409,7 @@ void LiveApp::create_controls() {
     SendMessageW(average_check_, BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(music_grid_check_, BM_SETCHECK, BST_UNCHECKED, 0);
     SendMessageW(beat_marks_check_, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(music_mode_check_, BM_SETCHECK, BST_CHECKED, 0);
     EnableWindow(apply_button_, FALSE);
     update_transport_controls();
 }
@@ -1249,6 +1554,7 @@ void LiveApp::layout_controls() {
     MoveWindow(scroll_speed_combo_, 675, row3_combo, 92, 220, TRUE);
     MoveWindow(music_grid_check_, 790, row3_combo - 1, 92, 24, TRUE);
     MoveWindow(beat_marks_check_, 896, row3_combo - 1, 92, 24, TRUE);
+    MoveWindow(music_mode_check_, 1002, row3_combo - 1, 96, 24, TRUE);
     MoveWindow(amplitude_label_, 12, row3_label, 65, 16, TRUE);
     MoveWindow(mono_channel_label_, 130, row3_label, 80, 16, TRUE);
     MoveWindow(history_label_, 560, row3_label, 55, 16, TRUE);
@@ -1347,11 +1653,22 @@ void LiveApp::clear_for_new_capture() {
     gram::clear_image(frozen_left_image_);
     gram::clear_image(frozen_right_image_);
     transient_markers_.clear();
+    previous_music_bins_.clear();
+    music_chroma_smooth_.fill(0.0);
+    music_frequency_ = 0.0;
+    music_cents_ = 0.0;
+    music_confidence_ = 0.0;
+    music_vibrato_cents_ = 0.0;
+    music_midi_note_ = 0;
+    music_chord_hint_.clear();
+    music_analysis_ready_ = false;
     last_frame_rms_ = 0.0;
     stereo_correlation_ = 0.0;
     reference_available_ = false;
     graph_dirty_ = true;
     next_status_tick_ = 0;
+    capture_packet_log_count_ = 0;
+    capture_nonfinite_log_count_ = 0;
 }
 
 void LiveApp::sync_settings_from_controls() {
@@ -1359,8 +1676,8 @@ void LiveApp::sync_settings_from_controls() {
     if (new_sample_rate <= 0) {
         throw std::runtime_error("Choose a valid analysis sample rate before applying settings.");
     }
-    if (new_sample_rate == 11025) {
-        throw std::runtime_error("11025 Hz is temporarily disabled in the live app because it is still causing capture startup failures.");
+    if (std::find(available_sample_rates_.begin(), available_sample_rates_.end(), new_sample_rate) == available_sample_rates_.end()) {
+        throw std::runtime_error("That sample rate is not reported as an exact shared-mode rate for the current default output device.");
     }
     const int new_fft = parse_combo_int(fft_combo_);
     if (new_fft <= 0) {
@@ -1638,6 +1955,22 @@ void LiveApp::start_capture() {
     capture_channels_ = static_cast<int>(mix_format_->nChannels);
     last_stream_sample_rate_ = capture_sample_rate_;
     last_stream_channels_ = (std::max)(1, (std::min)(capture_channels_, 2));
+    const std::wstring device_name = read_device_friendly_name(device_);
+    const std::wstring device_id = read_device_id(device_);
+    const std::wstring path_kind = endpoint_kind_text(device_name);
+    if (!device_name.empty()) {
+        active_source_text_ = device_name;
+    } else {
+        active_source_text_ = L"default output loopback";
+    }
+    {
+        std::wostringstream capture_start;
+        capture_start << L"name=" << (device_name.empty() ? L"(unknown)" : device_name)
+                      << L", kind=" << path_kind
+                      << L", id=" << (device_id.empty() ? L"(unknown)" : device_id)
+                      << L", mix=" << wave_format_text(mix_format_);
+        append_live_log(L"start_capture.device", capture_start.str());
+    }
 
     const REFERENCE_TIME buffer_duration = 10000000;
     const HRESULT initialize_client = audio_client_->Initialize(
@@ -1736,6 +2069,18 @@ void LiveApp::append_capture_chunk(const BYTE* data, UINT32 frames, bool silent)
 
     const int channels = (std::max)(capture_channels_, 1);
     const int bytes_per_frame = (std::max)(static_cast<int>(mix_format_->nBlockAlign), 1);
+    const int bytes_per_channel = (std::max)(bytes_per_frame / channels, 1);
+    if (capture_packet_log_count_ < 8) {
+        std::wostringstream packet;
+        packet << L"frames=" << frames
+               << L", silent=" << (silent ? L"true" : L"false")
+               << L", channels=" << channels
+               << L", frame_bytes=" << bytes_per_frame
+               << L", channel_bytes=" << bytes_per_channel
+               << L", format=" << wave_format_text(mix_format_);
+        append_live_log(L"capture.packet", packet.str());
+        ++capture_packet_log_count_;
+    }
 
     for (UINT32 frame = 0; frame < frames; ++frame) {
         double mono = 0.0;
@@ -1744,36 +2089,62 @@ void LiveApp::append_capture_chunk(const BYTE* data, UINT32 frames, bool silent)
         if (!silent && data != nullptr) {
             if (is_float_format(mix_format_)) {
                 const auto* values = reinterpret_cast<const float*>(data + frame * bytes_per_frame);
-                left = static_cast<double>(values[0]);
-                right = channels > 1 ? static_cast<double>(values[1]) : left;
+                left = sanitize_audio_sample(static_cast<double>(values[0]));
+                right = channels > 1 ? sanitize_audio_sample(static_cast<double>(values[1])) : left;
                 for (int channel = 0; channel < channels; ++channel) {
-                    mono += values[channel];
+                    mono += sanitize_audio_sample(static_cast<double>(values[channel]));
                 }
                 mono /= static_cast<double>(channels);
             } else if (is_pcm_format(mix_format_)) {
                 if (mix_format_->wBitsPerSample == 16) {
                     const auto* values = reinterpret_cast<const std::int16_t*>(data + frame * bytes_per_frame);
-                    left = static_cast<double>(values[0]) / 32768.0;
-                    right = channels > 1 ? static_cast<double>(values[1]) / 32768.0 : left;
+                    left = sanitize_audio_sample(static_cast<double>(values[0]) / 32768.0);
+                    right = channels > 1 ? sanitize_audio_sample(static_cast<double>(values[1]) / 32768.0) : left;
                     for (int channel = 0; channel < channels; ++channel) {
-                        mono += static_cast<double>(values[channel]) / 32768.0;
+                        mono += sanitize_audio_sample(static_cast<double>(values[channel]) / 32768.0);
                     }
                     mono /= static_cast<double>(channels);
                 } else if (mix_format_->wBitsPerSample == 32) {
                     const auto* values = reinterpret_cast<const std::int32_t*>(data + frame * bytes_per_frame);
-                    left = static_cast<double>(values[0]) / 2147483648.0;
-                    right = channels > 1 ? static_cast<double>(values[1]) / 2147483648.0 : left;
+                    left = sanitize_audio_sample(static_cast<double>(values[0]) / 2147483648.0);
+                    right = channels > 1 ? sanitize_audio_sample(static_cast<double>(values[1]) / 2147483648.0) : left;
                     for (int channel = 0; channel < channels; ++channel) {
-                        mono += static_cast<double>(values[channel]) / 2147483648.0;
+                        mono += sanitize_audio_sample(static_cast<double>(values[channel]) / 2147483648.0);
+                    }
+                    mono /= static_cast<double>(channels);
+                } else if (mix_format_->wBitsPerSample == 24 && bytes_per_channel >= 3) {
+                    const BYTE* frame_data = data + frame * bytes_per_frame;
+                    auto read_24 = [](const BYTE* bytes) -> double {
+                        std::int32_t value =
+                            static_cast<std::int32_t>(bytes[0]) |
+                            (static_cast<std::int32_t>(bytes[1]) << 8) |
+                            (static_cast<std::int32_t>(bytes[2]) << 16);
+                        if ((value & 0x00800000) != 0) {
+                            value |= ~0x00FFFFFF;
+                        }
+                        return sanitize_audio_sample(static_cast<double>(value) / 8388608.0);
+                    };
+                    left = read_24(frame_data);
+                    right = channels > 1 ? read_24(frame_data + bytes_per_channel) : left;
+                    for (int channel = 0; channel < channels; ++channel) {
+                        mono += read_24(frame_data + channel * bytes_per_channel);
                     }
                     mono /= static_cast<double>(channels);
                 }
             }
         }
 
-        resample_buffer_.push_back(std::clamp(mono, -1.0, 1.0));
-        left_resample_buffer_.push_back(std::clamp(left, -1.0, 1.0));
-        right_resample_buffer_.push_back(std::clamp(right, -1.0, 1.0));
+        if ((!std::isfinite(mono) || !std::isfinite(left) || !std::isfinite(right)) && capture_nonfinite_log_count_ < 12) {
+            std::wostringstream warning;
+            warning << L"Non-finite decoded sample at frame " << frame
+                    << L": mono=" << mono << L", left=" << left << L", right=" << right;
+            append_live_log(L"capture.nonfinite", warning.str());
+            ++capture_nonfinite_log_count_;
+        }
+
+        resample_buffer_.push_back(sanitize_audio_sample(mono));
+        left_resample_buffer_.push_back(sanitize_audio_sample(left));
+        right_resample_buffer_.push_back(sanitize_audio_sample(right));
     }
 
     if (capture_sample_rate_ <= 0 || analysis_sample_rate_ <= 0) {
@@ -1846,7 +2217,8 @@ void LiveApp::process_available_analysis_frames() {
             stereo_correlation_ = cross / std::sqrt(left_energy * right_energy);
         }
         const std::size_t frame_end_sample = captured_samples_.size();
-        if (rms > 0.01 && rms > last_frame_rms_ * 1.45) {
+        const bool transient = rms > 0.01 && rms > last_frame_rms_ * 1.45;
+        if (transient) {
             transient_markers_.push_back(frame_end_sample);
             while (transient_markers_.size() > 128) {
                 transient_markers_.erase(transient_markers_.begin());
@@ -1875,6 +2247,7 @@ void LiveApp::process_available_analysis_frames() {
         update_average_bins(average_bins_, db_bins_);
         update_average_bins(average_bins_left_, db_bins_left_);
         update_average_bins(average_bins_right_, db_bins_right_);
+        update_music_analysis_frame(rms, transient);
         const auto mix_column = gram::render_column(db_bins_, analysis_sample_rate_, settings_);
         const auto left_column = gram::render_column(db_bins_left_, analysis_sample_rate_, settings_);
         const auto right_column = gram::render_column(db_bins_right_, analysis_sample_rate_, settings_);
@@ -1925,9 +2298,176 @@ void LiveApp::trim_analysis_buffer() {
     }
 }
 
+void LiveApp::update_music_analysis_frame(double rms, bool transient) {
+    if (!music_mode_enabled_ || db_bins_.size() < 8 || analysis_sample_rate_ <= 0) {
+        music_analysis_ready_ = false;
+        return;
+    }
+
+    std::array<double, 12> frame_chroma {};
+    double amplitude_sum = 0.0;
+    double log_sum = 0.0;
+    int amplitude_count = 0;
+    double flux_sum = 0.0;
+    const double nyquist = analysis_sample_rate_ / 2.0;
+
+    for (std::size_t index = 2; index + 2 < db_bins_.size(); ++index) {
+        const double level_db = db_bins_[index];
+        if (level_db <= -120.0) {
+            continue;
+        }
+        const double frequency =
+            (static_cast<double>(index) / static_cast<double>(db_bins_.size() - 1)) * nyquist;
+        if (frequency < 27.5 || frequency > 5000.0) {
+            continue;
+        }
+
+        const double amplitude = std::pow(10.0, level_db / 20.0);
+        amplitude_sum += amplitude;
+        log_sum += std::log((std::max)(amplitude, 1.0e-12));
+        ++amplitude_count;
+
+        if (previous_music_bins_.size() == db_bins_.size()) {
+            flux_sum += (std::max)(0.0, level_db - previous_music_bins_[index]);
+        }
+
+        const bool local_peak = level_db >= db_bins_[index - 1] && level_db >= db_bins_[index + 1];
+        const double peak_weight = local_peak ? 1.6 : 0.45;
+        const int midi = midi_from_frequency(frequency);
+        const int pitch_class = ((midi % 12) + 12) % 12;
+        const double cents = 1200.0 * std::log2(frequency / frequency_from_midi(midi));
+        const double tuning_weight = (std::max)(0.0, 1.0 - std::abs(cents) / 50.0);
+        const double salience = amplitude * peak_weight * (0.30 + 0.70 * tuning_weight);
+        frame_chroma[static_cast<std::size_t>(pitch_class)] += salience;
+
+        if (local_peak) {
+            for (int harmonic = 2; harmonic <= 4; ++harmonic) {
+                const double folded = frequency / static_cast<double>(harmonic);
+                if (folded < 27.5) {
+                    break;
+                }
+                const int folded_midi = midi_from_frequency(folded);
+                const int folded_class = ((folded_midi % 12) + 12) % 12;
+                frame_chroma[static_cast<std::size_t>(folded_class)] += salience / static_cast<double>(harmonic);
+            }
+        }
+    }
+
+    previous_music_bins_ = db_bins_;
+
+    double chroma_peak = 0.0;
+    double chroma_total = 0.0;
+    for (const double value : frame_chroma) {
+        chroma_peak = (std::max)(chroma_peak, value);
+        chroma_total += value;
+    }
+    if (chroma_peak <= 0.0 || chroma_total <= 0.0) {
+        music_analysis_ready_ = false;
+        return;
+    }
+
+    for (double& value : frame_chroma) {
+        value /= chroma_peak;
+    }
+
+    const double alpha = transient ? 0.10 : 0.22;
+    for (std::size_t index = 0; index < music_chroma_smooth_.size(); ++index) {
+        music_chroma_smooth_[index] =
+            (1.0 - alpha) * music_chroma_smooth_[index] + alpha * frame_chroma[index];
+    }
+
+    int best_pitch_class = 0;
+    double best_value = -1.0;
+    double second_value = -1.0;
+    for (int index = 0; index < 12; ++index) {
+        const double value = music_chroma_smooth_[static_cast<std::size_t>(index)];
+        if (value > best_value) {
+            second_value = best_value;
+            best_value = value;
+            best_pitch_class = index;
+        } else if (value > second_value) {
+            second_value = value;
+        }
+    }
+
+    const auto peaks = collect_top_peaks(db_bins_, 8);
+    double chosen_frequency = 0.0;
+    int chosen_midi = 0;
+    double chosen_cents = 0.0;
+    if (!peaks.empty()) {
+        double best_score = -1.0e9;
+        for (const auto& peak : peaks) {
+            const int peak_class = ((peak.midi_note % 12) + 12) % 12;
+            int distance = std::abs(peak_class - best_pitch_class);
+            distance = (std::min)(distance, 12 - distance);
+            const double score = peak.level_db - static_cast<double>(distance * 10);
+            if (score > best_score) {
+                best_score = score;
+                chosen_frequency = peak.frequency;
+                chosen_midi = peak.midi_note;
+                chosen_cents = peak.cents;
+            }
+        }
+    }
+
+    if (chosen_frequency <= 0.0) {
+        if (const auto tuner = estimate_tuner_pitch()) {
+            chosen_frequency = tuner->frequency;
+            chosen_midi = tuner->midi_note;
+            chosen_cents = tuner->cents;
+        }
+    }
+
+    if (chosen_frequency <= 0.0) {
+        music_analysis_ready_ = false;
+        return;
+    }
+
+    const int chosen_class = ((chosen_midi % 12) + 12) % 12;
+    int class_offset = best_pitch_class - chosen_class;
+    if (class_offset > 6) {
+        class_offset -= 12;
+    } else if (class_offset < -6) {
+        class_offset += 12;
+    }
+    chosen_midi += class_offset;
+    const double chroma_reference = frequency_from_midi(chosen_midi);
+    chosen_cents = 1200.0 * std::log2(chosen_frequency / chroma_reference);
+
+    if (music_frequency_ > 0.0) {
+        const double vibrato_cents = std::abs(1200.0 * std::log2(chosen_frequency / music_frequency_));
+        music_vibrato_cents_ = 0.78 * music_vibrato_cents_ + 0.22 * vibrato_cents;
+        if (vibrato_cents <= 45.0) {
+            chosen_frequency = 0.72 * music_frequency_ + 0.28 * chosen_frequency;
+            chosen_cents = 1200.0 * std::log2(chosen_frequency / chroma_reference);
+        }
+    } else {
+        music_vibrato_cents_ = 0.0;
+    }
+
+    const double arithmetic_mean = amplitude_count > 0 ? amplitude_sum / static_cast<double>(amplitude_count) : 0.0;
+    const double geometric_mean = amplitude_count > 0 ? std::exp(log_sum / static_cast<double>(amplitude_count)) : 0.0;
+    const double flatness = arithmetic_mean > 0.0 ? geometric_mean / arithmetic_mean : 1.0;
+    const double harmonicity = std::clamp(1.0 - flatness, 0.0, 1.0);
+    const double flux_penalty = std::clamp(flux_sum / (static_cast<double>(db_bins_.size()) * 18.0), 0.0, 1.0);
+    const double dominance = std::clamp(best_value - (std::max)(0.0, second_value), 0.0, 1.0);
+    const double vibrato_bonus = music_vibrato_cents_ > 2.0 && music_vibrato_cents_ < 45.0 ? 0.10 : 0.0;
+    const double rms_bonus = std::clamp((rms - 0.01) * 8.0, 0.0, 0.18);
+    music_confidence_ = std::clamp(
+        0.18 + dominance * 0.46 + harmonicity * 0.28 + vibrato_bonus + rms_bonus - flux_penalty - (transient ? 0.12 : 0.0),
+        0.0,
+        1.0);
+
+    music_frequency_ = chosen_frequency;
+    music_midi_note_ = chosen_midi;
+    music_cents_ = chosen_cents;
+    music_chord_hint_ = chord_hint_from_chroma(music_chroma_smooth_);
+    music_analysis_ready_ = true;
+}
+
 void LiveApp::start_playback() {
     if (captured_samples_.empty()) {
-        MessageBoxW(hwnd_, L"Capture some output audio first.", L"gram_live", MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, L"Capture some output audio first.", kLiveAppName, MB_ICONINFORMATION);
         return;
     }
 
@@ -1949,7 +2489,7 @@ void LiveApp::start_playback() {
             reinterpret_cast<DWORD_PTR>(hwnd_),
             0,
             CALLBACK_WINDOW) != MMSYSERR_NOERROR) {
-        MessageBoxW(hwnd_, L"Unable to open the playback device.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to open the playback device.", kLiveAppName, MB_ICONERROR);
         wave_out_ = nullptr;
         return;
     }
@@ -1963,7 +2503,7 @@ void LiveApp::start_playback() {
     waveOutPrepareHeader(wave_out_, &output_header_, sizeof(output_header_));
     if (waveOutWrite(wave_out_, &output_header_, sizeof(output_header_)) != MMSYSERR_NOERROR) {
         stop_playback();
-        MessageBoxW(hwnd_, L"Unable to start playback.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to start playback.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -1975,18 +2515,18 @@ void LiveApp::start_playback() {
 
 void LiveApp::start_loop_playback() {
     if (captured_samples_.empty()) {
-        MessageBoxW(hwnd_, L"Capture some output audio first.", L"gram_live", MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, L"Capture some output audio first.", kLiveAppName, MB_ICONINFORMATION);
         return;
     }
     if (!marker_in_set_ || !marker_out_set_ || marker_in_sample_ == marker_out_sample_) {
-        MessageBoxW(hwnd_, L"Set distinct In and Out markers on the spectrogram first.", L"gram_live", MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, L"Set distinct In and Out markers on the spectrogram first.", kLiveAppName, MB_ICONINFORMATION);
         return;
     }
 
     const std::size_t begin = (std::min)(marker_in_sample_, marker_out_sample_);
     const std::size_t end = (std::max)(marker_in_sample_, marker_out_sample_);
     if (begin >= end || end > captured_samples_.size()) {
-        MessageBoxW(hwnd_, L"The current marker range is outside the captured audio.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"The current marker range is outside the captured audio.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -2008,7 +2548,7 @@ void LiveApp::start_loop_playback() {
             reinterpret_cast<DWORD_PTR>(hwnd_),
             0,
             CALLBACK_WINDOW) != MMSYSERR_NOERROR) {
-        MessageBoxW(hwnd_, L"Unable to open the playback device.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to open the playback device.", kLiveAppName, MB_ICONERROR);
         wave_out_ = nullptr;
         loop_playback_ = false;
         return;
@@ -2024,7 +2564,7 @@ void LiveApp::start_loop_playback() {
     waveOutPrepareHeader(wave_out_, &output_header_, sizeof(output_header_));
     if (waveOutWrite(wave_out_, &output_header_, sizeof(output_header_)) != MMSYSERR_NOERROR) {
         stop_playback();
-        MessageBoxW(hwnd_, L"Unable to start loop playback.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to start loop playback.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -2056,7 +2596,7 @@ void LiveApp::stop_playback() {
 
 void LiveApp::save_capture() {
     if (captured_samples_.empty()) {
-        MessageBoxW(hwnd_, L"Nothing has been captured yet.", L"gram_live", MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, L"Nothing has been captured yet.", kLiveAppName, MB_ICONINFORMATION);
         return;
     }
 
@@ -2078,7 +2618,7 @@ void LiveApp::save_capture() {
         gram::write_wav_mono_16(narrow_system_path(path), analysis_sample_rate_, captured_samples_);
     } catch (const std::exception& error) {
         const auto message = widen(error.what());
-        MessageBoxW(hwnd_, message.c_str(), L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, message.c_str(), kLiveAppName, MB_ICONERROR);
     }
 }
 
@@ -2102,7 +2642,7 @@ void LiveApp::save_png() {
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     if (width <= 0 || height <= 0) {
-        MessageBoxW(hwnd_, L"Nothing is available to export yet.", L"gram_live", MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, L"Nothing is available to export yet.", kLiveAppName, MB_ICONINFORMATION);
         return;
     }
 
@@ -2128,7 +2668,7 @@ void LiveApp::save_png() {
         if (screen_dc != nullptr) {
             ReleaseDC(hwnd_, screen_dc);
         }
-        MessageBoxW(hwnd_, L"Unable to create an export bitmap.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to create an export bitmap.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -2207,13 +2747,13 @@ void LiveApp::save_png() {
     ReleaseDC(hwnd_, screen_dc);
 
     if (FAILED(result)) {
-        MessageBoxW(hwnd_, L"Unable to save the PNG export.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to save the PNG export.", kLiveAppName, MB_ICONERROR);
     }
 }
 
 void LiveApp::save_note_csv() {
     if (captured_samples_.size() < static_cast<std::size_t>(settings_.fft_size)) {
-        MessageBoxW(hwnd_, L"Capture more audio before exporting note data.", L"gram_live", MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, L"Capture more audio before exporting note data.", kLiveAppName, MB_ICONINFORMATION);
         return;
     }
 
@@ -2233,7 +2773,7 @@ void LiveApp::save_note_csv() {
 
     std::ofstream output(narrow_system_path(path), std::ios::binary);
     if (!output) {
-        MessageBoxW(hwnd_, L"Unable to open the CSV file for writing.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to open the CSV file for writing.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -2287,7 +2827,7 @@ void LiveApp::save_preset() {
 
     std::ofstream output(narrow_system_path(path), std::ios::binary);
     if (!output) {
-        MessageBoxW(hwnd_, L"Unable to open the preset file for writing.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to open the preset file for writing.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -2306,6 +2846,7 @@ void LiveApp::save_preset() {
     output << "grid=" << (SendMessageW(grid_check_, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0) << "\n";
     output << "peak_hold=" << (SendMessageW(peak_hold_check_, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0) << "\n";
     output << "average=" << (SendMessageW(average_check_, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0) << "\n";
+    output << "music_mode=" << (SendMessageW(music_mode_check_, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0) << "\n";
 }
 
 void LiveApp::load_preset() {
@@ -2324,7 +2865,7 @@ void LiveApp::load_preset() {
 
     std::ifstream input(narrow_system_path(path), std::ios::binary);
     if (!input) {
-        MessageBoxW(hwnd_, L"Unable to open the preset file.", L"gram_live", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Unable to open the preset file.", kLiveAppName, MB_ICONERROR);
         return;
     }
 
@@ -2366,9 +2907,12 @@ void LiveApp::load_preset() {
             SendMessageW(peak_hold_check_, BM_SETCHECK, _wtoi(value.c_str()) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
         } else if (key == "average") {
             SendMessageW(average_check_, BM_SETCHECK, _wtoi(value.c_str()) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+        } else if (key == "music_mode") {
+            SendMessageW(music_mode_check_, BM_SETCHECK, _wtoi(value.c_str()) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
         }
     }
 
+    music_mode_enabled_ = SendMessageW(music_mode_check_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     update_level_labels();
     mark_settings_dirty();
 }
@@ -2402,7 +2946,7 @@ void LiveApp::update_status() {
             parts_measure.push_back(measure.empty() ? parts_text.back() : std::move(measure));
         };
 
-        push_part(L"Source: default output loopback");
+        push_part(L"Source: " + active_source_text_, L"Source: FxSound Speakers (FxSound Audio Enhancer)");
         push_part(last_stream_sample_rate_ > 0 ? (L"Stream: " + std::to_wstring(last_stream_sample_rate_) + L" Hz") : L"",
             L"Stream: 384000 Hz");
         if (use_stereo_display()) {
@@ -2435,6 +2979,7 @@ void LiveApp::update_status() {
         push_part(music.pitch.empty() ? L"" : L"Pitch: " + music.pitch, L"Pitch: C#10");
         push_part(music.cents.empty() ? L"" : L"Cents: " + music.cents, L"Cents: +100.0 cents");
         push_part(music.chord.empty() ? L"" : L"Chord: " + music.chord, L"Chord: C# major");
+        push_part(music.confidence.empty() ? L"" : L"Conf: " + music.confidence, L"Conf: 100% vib");
         push_part(corr_text.empty() ? L"" : L"Corr: " + corr_text, L"Corr: -1.00");
         push_part(trim_for_status(now_playing_text_, 72), fixed_status_text(L"Now playing: " + std::wstring(56, L'W'), 72));
         push_part(cursor_text_, L"Cursor: 30000 Hz, -180.0 dB");
@@ -2567,8 +3112,13 @@ void LiveApp::update_view_controls() {
         GetWindowTextW(display_combo_, display_text, 31);
     }
     const bool spectrum_mode = wcscmp(display_text, L"spectrum") == 0;
+    const bool music_mode_applicable =
+        wcscmp(display_text, L"spectrogram") == 0 ||
+        wcscmp(display_text, L"spectrum") == 0 ||
+        wcscmp(display_text, L"room") == 0;
     ShowWindow(peak_hold_check_, spectrum_mode ? SW_SHOW : SW_HIDE);
     ShowWindow(average_check_, spectrum_mode ? SW_SHOW : SW_HIDE);
+    ShowWindow(music_mode_check_, music_mode_applicable ? SW_SHOW : SW_HIDE);
     update_tuner_controls();
 }
 
@@ -2812,20 +3362,29 @@ std::vector<SpectrumPeak> LiveApp::collect_top_peaks(const std::vector<double>& 
     const double nyquist = analysis_sample_rate_ / 2.0;
     const double min_peak_frequency = std::max(settings_.min_frequency, 1.0);
     for (std::size_t index = 1; index + 1 < bins.size(); ++index) {
-        const double level = bins[index];
-        if (level < settings_.min_db + 12.0) {
+        const double left = bins[index - 1];
+        const double center = bins[index];
+        const double right = bins[index + 1];
+        if (center < settings_.min_db + 12.0) {
             continue;
         }
-        if (level < bins[index - 1] || level < bins[index + 1]) {
+        if (center < left || center < right) {
             continue;
         }
-        const double frequency = (static_cast<double>(index) / static_cast<double>(bins.size() - 1)) * nyquist;
+        double bin_offset = 0.0;
+        const double denominator = left - (2.0 * center) + right;
+        if (std::abs(denominator) > 1.0e-9) {
+            bin_offset = 0.5 * (left - right) / denominator;
+            bin_offset = std::clamp(bin_offset, -1.0, 1.0);
+        }
+        const double refined_index = static_cast<double>(index) + bin_offset;
+        const double frequency = (refined_index / static_cast<double>(bins.size() - 1)) * nyquist;
         if (frequency < min_peak_frequency || frequency > max_display_frequency()) {
             continue;
         }
         SpectrumPeak peak;
         peak.frequency = frequency;
-        peak.level_db = level;
+        peak.level_db = center;
         double cents = 0.0;
         peak.midi_note = midi_from_frequency(frequency);
         describe_note_from_frequency(frequency, &cents);
@@ -2848,6 +3407,25 @@ double LiveApp::current_stereo_correlation() const {
 
 MusicStatusFields LiveApp::current_music_status() const {
     MusicStatusFields fields;
+    if (music_mode_enabled_ && music_analysis_ready_) {
+        fields.pitch = note_name_from_midi(music_midi_note_);
+        fields.cents = format_signed_cents(music_cents_);
+        fields.chord = music_chord_hint_;
+        std::wostringstream confidence;
+        confidence << std::fixed << std::setprecision(0) << (music_confidence_ * 100.0) << L"%";
+        if (music_vibrato_cents_ >= 4.0 && music_vibrato_cents_ <= 45.0) {
+            confidence << L" vib";
+        }
+        fields.confidence = confidence.str();
+        return fields;
+    }
+    if (const auto tuner = estimate_tuner_pitch()) {
+        fields.pitch = note_name_from_midi(tuner->midi_note);
+        fields.cents = format_signed_cents(tuner->cents);
+        std::wostringstream confidence;
+        confidence << std::fixed << std::setprecision(0) << (tuner->confidence * 100.0) << L"%";
+        fields.confidence = confidence.str();
+    }
     const auto peaks = collect_top_peaks(selected_bins(freeze_display_), use_stereo_display() ? 4 : 5);
     if (peaks.empty()) {
         return fields;
@@ -2859,9 +3437,12 @@ MusicStatusFields LiveApp::current_music_status() const {
         midi_notes.push_back(peak.midi_note);
     }
 
-    double cents = 0.0;
-    fields.pitch = describe_note_from_frequency(peaks.front().frequency, &cents);
-    fields.cents = format_signed_cents(cents);
+    if (fields.pitch.empty()) {
+        double cents = 0.0;
+        fields.pitch = describe_note_from_frequency(peaks.front().frequency, &cents);
+        fields.cents = format_signed_cents(cents);
+        fields.confidence = L"";
+    }
     fields.chord = chord_hint_from_midis(midi_notes);
     return fields;
 }
@@ -2875,6 +3456,9 @@ std::wstring LiveApp::current_music_summary() const {
     stream << L"Music: " << fields.pitch;
     if (!fields.cents.empty()) {
         stream << L" " << fields.cents;
+    }
+    if (!fields.confidence.empty()) {
+        stream << L" | Conf " << fields.confidence;
     }
     if (!fields.chord.empty()) {
         stream << L" | " << fields.chord;
@@ -2920,6 +3504,190 @@ std::vector<std::wstring> LiveApp::active_instrument_notes() const {
         return { L"G3", L"D4", L"A4", L"E5" };
     }
     return {};
+}
+
+const std::vector<std::int16_t>& LiveApp::selected_tuner_samples() const {
+    if (mono_channel_mode_ == MonoChannelMode::Left && !captured_left_samples_.empty()) {
+        return captured_left_samples_;
+    }
+    if (mono_channel_mode_ == MonoChannelMode::Right && !captured_right_samples_.empty()) {
+        return captured_right_samples_;
+    }
+    if (!captured_samples_.empty()) {
+        return captured_samples_;
+    }
+    if (!captured_left_samples_.empty()) {
+        return captured_left_samples_;
+    }
+    return captured_right_samples_;
+}
+
+std::vector<double> LiveApp::instrument_target_frequencies() const {
+    std::vector<double> targets;
+    for (const auto& note_name : active_instrument_notes()) {
+        const int midi = midi_from_note_name(note_name);
+        if (midi >= 0) {
+            targets.push_back(frequency_from_midi(midi));
+        }
+    }
+    return targets;
+}
+
+int LiveApp::tuner_reference_midi(double frequency) const {
+    const auto instrument_notes = active_instrument_notes();
+    if (!instrument_notes.empty()) {
+        int best_midi = -1;
+        double best_cents = std::numeric_limits<double>::infinity();
+        for (const auto& note_name : instrument_notes) {
+            const int midi = midi_from_note_name(note_name);
+            if (midi < 0) {
+                continue;
+            }
+            const double reference = frequency_from_midi(midi);
+            const double cents = std::abs(1200.0 * std::log2(frequency / reference));
+            if (cents < best_cents) {
+                best_cents = cents;
+                best_midi = midi;
+            }
+        }
+        if (best_midi >= 0) {
+            return best_midi;
+        }
+    }
+    return midi_from_frequency(frequency);
+}
+
+std::optional<SpectrumPeak> LiveApp::estimate_tuner_pitch() const {
+    if (analysis_sample_rate_ <= 0) {
+        return std::nullopt;
+    }
+
+    const auto& samples = selected_tuner_samples();
+    if (samples.size() < 1024) {
+        return std::nullopt;
+    }
+
+    const std::size_t window_size = (std::min)(
+        samples.size(),
+        static_cast<std::size_t>((std::max)(4096, (std::min)(analysis_sample_rate_ / 2, 8192))));
+    if (window_size < 1024) {
+        return std::nullopt;
+    }
+
+    std::vector<double> signal(window_size);
+    const std::size_t start = samples.size() - window_size;
+    double mean = 0.0;
+    for (std::size_t index = 0; index < window_size; ++index) {
+        const double value = static_cast<double>(samples[start + index]) / 32768.0;
+        signal[index] = value;
+        mean += value;
+    }
+    mean /= static_cast<double>(window_size);
+
+    double rms = 0.0;
+    for (double& value : signal) {
+        value -= mean;
+        rms += value * value;
+    }
+    rms = std::sqrt(rms / static_cast<double>(window_size));
+    if (rms < 0.0035) {
+        return std::nullopt;
+    }
+
+    double min_frequency = (std::max)(settings_.min_frequency, 27.5);
+    double max_frequency = (std::min)(max_display_frequency(), 2000.0);
+    const auto targets = instrument_target_frequencies();
+    if (!targets.empty()) {
+        const auto [min_it, max_it] = std::minmax_element(targets.begin(), targets.end());
+        min_frequency = (std::max)(20.0, *min_it * 0.72);
+        max_frequency = (std::min)(2000.0, *max_it * 1.35);
+    }
+    if (!(min_frequency > 0.0) || !(max_frequency > min_frequency)) {
+        return std::nullopt;
+    }
+
+    const std::size_t lag_min = (std::max<std::size_t>)(2, static_cast<std::size_t>(std::floor(static_cast<double>(analysis_sample_rate_) / max_frequency)));
+    const std::size_t lag_max = (std::min<std::size_t>)(window_size / 2, static_cast<std::size_t>(std::ceil(static_cast<double>(analysis_sample_rate_) / min_frequency)));
+    if (lag_max <= lag_min + 2) {
+        return std::nullopt;
+    }
+
+    std::vector<double> difference(lag_max + 1, 0.0);
+    for (std::size_t lag = lag_min; lag <= lag_max; ++lag) {
+        double total = 0.0;
+        for (std::size_t index = 0; index + lag < window_size; ++index) {
+            const double delta = signal[index] - signal[index + lag];
+            total += delta * delta;
+        }
+        difference[lag] = total;
+    }
+
+    std::vector<double> cmndf(lag_max + 1, 1.0);
+    double cumulative = 0.0;
+    for (std::size_t lag = 1; lag <= lag_max; ++lag) {
+        cumulative += difference[lag];
+        if (cumulative > 0.0) {
+            cmndf[lag] = difference[lag] * static_cast<double>(lag) / cumulative;
+        }
+    }
+
+    constexpr double kThreshold = 0.15;
+    std::size_t best_lag = 0;
+    double best_value = std::numeric_limits<double>::infinity();
+    for (std::size_t lag = lag_min; lag <= lag_max; ++lag) {
+        const double value = cmndf[lag];
+        if (value < best_value) {
+            best_value = value;
+            best_lag = lag;
+        }
+        if (value < kThreshold) {
+            best_lag = lag;
+            while (best_lag + 1 <= lag_max && cmndf[best_lag + 1] <= cmndf[best_lag]) {
+                ++best_lag;
+            }
+            best_value = cmndf[best_lag];
+            break;
+        }
+    }
+
+    if (best_lag == 0 || best_value > 0.35) {
+        const auto peaks = collect_top_peaks(selected_bins(freeze_display_), 1);
+        if (peaks.empty()) {
+            return std::nullopt;
+        }
+        SpectrumPeak fallback = peaks.front();
+        fallback.midi_note = tuner_reference_midi(fallback.frequency);
+        const double reference = frequency_from_midi(fallback.midi_note);
+        fallback.cents = 1200.0 * std::log2(fallback.frequency / reference);
+        fallback.confidence = 0.0;
+        return fallback;
+    }
+
+    double lag_offset = 0.0;
+    if (best_lag > lag_min && best_lag + 1 <= lag_max) {
+        const double left = cmndf[best_lag - 1];
+        const double center = cmndf[best_lag];
+        const double right = cmndf[best_lag + 1];
+        const double denominator = left - (2.0 * center) + right;
+        if (std::abs(denominator) > 1.0e-9) {
+            lag_offset = 0.5 * (left - right) / denominator;
+            lag_offset = std::clamp(lag_offset, -1.0, 1.0);
+        }
+    }
+
+    const double refined_lag = static_cast<double>(best_lag) + lag_offset;
+    if (!(refined_lag > 0.0)) {
+        return std::nullopt;
+    }
+
+    SpectrumPeak estimate;
+    estimate.frequency = static_cast<double>(analysis_sample_rate_) / refined_lag;
+    estimate.level_db = 20.0 * std::log10((std::max)(rms, 1.0e-9));
+    estimate.midi_note = tuner_reference_midi(estimate.frequency);
+    const double reference = frequency_from_midi(estimate.midi_note);
+    estimate.cents = 1200.0 * std::log2(estimate.frequency / reference);
+    estimate.confidence = std::clamp(1.0 - best_value, 0.0, 1.0);
+    return estimate;
 }
 
 std::size_t LiveApp::marker_sample_from_cursor() const {
@@ -3054,8 +3822,8 @@ void LiveApp::draw_peak_labels(HDC dc, const RECT& plot, const std::vector<Spect
 
 void LiveApp::draw_tuner(HDC dc, const RECT& outer, const RECT& plot) {
     draw_spectrum_axes(dc, outer, plot);
-    const auto peaks = collect_top_peaks(selected_bins(freeze_display_), 5);
-    if (peaks.empty()) {
+    const auto estimate = estimate_tuner_pitch();
+    if (!estimate) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(210, 210, 210));
         const wchar_t* text = L"No stable pitch";
@@ -3063,10 +3831,10 @@ void LiveApp::draw_tuner(HDC dc, const RECT& outer, const RECT& plot) {
         return;
     }
 
-    double cents = 0.0;
-    const std::wstring note = describe_note_from_frequency(peaks.front().frequency, &cents);
+    const double cents = estimate->cents;
+    const std::wstring note = note_name_from_midi(estimate->midi_note);
     const std::wstring cents_text = format_signed_cents(cents);
-    const std::wstring freq_text = format_frequency_label(peaks.front().frequency);
+    const std::wstring freq_text = format_frequency_label(estimate->frequency);
 
     RECT note_rect = plot;
     note_rect.top += 20;
@@ -3111,7 +3879,7 @@ void LiveApp::draw_tuner(HDC dc, const RECT& outer, const RECT& plot) {
     harmonics << L"Harmonics:";
     for (int harmonic = 2; harmonic <= 6; ++harmonic) {
         harmonics << L" " << harmonic << L"x "
-                  << format_frequency_label(peaks.front().frequency * harmonic);
+                  << format_frequency_label(estimate->frequency * harmonic);
     }
     DrawTextW(dc, harmonics.str().c_str(), -1, &harm_rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
 
@@ -3120,7 +3888,8 @@ void LiveApp::draw_tuner(HDC dc, const RECT& outer, const RECT& plot) {
         RECT strings_rect = plot;
         strings_rect.top += 242;
         std::wostringstream stream;
-        stream << L"Targets:";
+        stream << L"Target " << note << L" | Confidence " << std::fixed << std::setprecision(0)
+               << (estimate->confidence * 100.0) << L"% | Strings:";
         for (const auto& string_note : strings) {
             stream << L" " << string_note;
         }
