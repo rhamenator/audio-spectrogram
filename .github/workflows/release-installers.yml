@@ -27,6 +27,7 @@ jobs:
           Set-Content -Path smoke.wav -Value ''
           & .\build\Release\audio-spectrogram-cli.exe smoke.wav smoke.ppm
           if ($LASTEXITCODE -eq 0) { throw 'Malformed WAV unexpectedly succeeded' }
+          exit 0
       - run: choco install innosetup --no-progress -y
       - shell: pwsh
         run: |
