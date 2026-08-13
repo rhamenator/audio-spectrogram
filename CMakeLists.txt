@@ -21,6 +21,18 @@ set_target_properties(audio_spectrogram_cli PROPERTIES OUTPUT_NAME "audio-spectr
 
 target_link_libraries(audio_spectrogram_cli PRIVATE gram_core)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(gram_core_tests tests/spectrogram_core_tests.cpp)
+    target_link_libraries(gram_core_tests PRIVATE gram_core)
+    add_test(NAME gram_core_tests COMMAND gram_core_tests)
+    if(MSVC)
+        target_compile_options(gram_core_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(gram_core_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endif()
+
 if(WIN32)
     add_executable(audio_spectrogram WIN32
         src/win_live_app.cpp
