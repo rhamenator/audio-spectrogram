@@ -1,0 +1,99 @@
+name: Release installers
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  APP_VERSION: 0.1.${{ github.run_number }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build all Windows applications
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+      - name: CLI smoke test
+        shell: pwsh
+        run: |
+          Set-Content -Path smoke.wav -Value ''
+          & .\build\Release\audio-spectrogram-cli.exe smoke.wav smoke.ppm
+          if ($LASTEXITCODE -eq 0) { throw 'Malformed WAV unexpectedly succeeded' }
+      - run: choco install innosetup --no-progress -y
+      - shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$env:APP_VERSION" packaging\windows\audio-spectrogram.iss
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio-spectrogram-windows
+          path: artifacts/*.exe
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --parallel
+      - name: Build CLI pkg
+        run: |
+          mkdir -p package-root/usr/local/bin artifacts
+          install -m 755 build/audio-spectrogram-cli package-root/usr/local/bin/audio-spectrogram-cli
+          pkgbuild --root package-root --identifier com.yourfoxprodeveloper.audio-spectrogram-cli --version "$APP_VERSION" "artifacts/audio-spectrogram-${APP_VERSION}-macos-${{ matrix.arch }}.pkg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio-spectrogram-macos-${{ matrix.arch }}
+          path: artifacts/*.pkg
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --parallel
+      - name: Build CLI deb and rpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby-dev rpm
+          sudo gem install --no-document fpm
+          mkdir -p package-root/usr/bin artifacts
+          install -m 755 build/audio-spectrogram-cli package-root/usr/bin/audio-spectrogram-cli
+          fpm -s dir -t deb -n audio-spectrogram -v "$APP_VERSION" -C package-root -p "artifacts/audio-spectrogram_${APP_VERSION}_amd64.deb" .
+          fpm -s dir -t rpm -n audio-spectrogram -v "$APP_VERSION" -C package-root -p "artifacts/audio-spectrogram-${APP_VERSION}-1.x86_64.rpm" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio-spectrogram-linux
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          pattern: audio-spectrogram-*
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" release-assets/* --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
