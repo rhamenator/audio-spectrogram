@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/logo.png" alt="Audio Spectrogram logo" width="220">
+</p>
+
 # audio-spectrogram
 
 `audio-spectrogram` is the standalone evolution of the clean-room reimplementation work for
