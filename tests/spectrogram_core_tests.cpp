@@ -3,6 +3,8 @@
 #include <cassert>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -58,6 +60,29 @@ int main() {
     assert(loaded.channels == 1);
     assert(loaded.samples.size() == 3);
     assert(std::abs(loaded.samples[1] - 0.5) < 1.0e-6);
+
+    // A 6-channel file is mixed down to stereo: FL alone on the left side, FR alone on the right.
+    {
+        const int channel_count = 6;
+        const std::vector<std::int16_t> frame_data = {16'384, -16'384, 0, 0, 0, 0};
+        std::string bytes;
+        const auto put16 = [&bytes](std::uint16_t v) { bytes.push_back(char(v & 0xFF)); bytes.push_back(char(v >> 8)); };
+        const auto put32 = [&bytes, &put16](std::uint32_t v) { put16(v & 0xFFFF); put16(v >> 16); };
+        const std::uint32_t data_bytes = 2u * channel_count * 2u;
+        bytes += "RIFF"; put32(36 + data_bytes); bytes += "WAVEfmt "; put32(16); put16(1); put16(channel_count);
+        put32(8'000); put32(8'000 * channel_count * 2); put16(channel_count * 2); put16(16);
+        bytes += "data"; put32(data_bytes);
+        for (int frame = 0; frame < 2; ++frame) {
+            for (const auto v : frame_data) { put16(static_cast<std::uint16_t>(v)); }
+        }
+        const auto multi = std::filesystem::temp_directory_path() / "gram-core-test-6ch.wav";
+        { std::ofstream out(multi, std::ios::binary); out.write(bytes.data(), std::streamsize(bytes.size())); }
+        const auto mixed = load_wav(multi.string());
+        std::filesystem::remove(multi);
+        assert(mixed.channels == 2);
+        assert(mixed.samples.size() == 4);
+        assert(mixed.samples[0] > 0.1 && mixed.samples[1] < -0.1);
+    }
 
     return 0;
 }
