@@ -185,14 +185,45 @@ void SpectrogramView::rerenderHistory() {
 }
 
 bool SpectrogramView::computeBins(std::int64_t endFrame) {
-    if (!capture_ || !capture_->window(endFrame, settings_.fftSize, settings_.channel, samples_)) {
+    if (!capture_) {
         return false;
     }
-    plan_.compute_db(samples_.data(), bins_, -240.0, &profiling_);
-    if (settings_.calibrateDbfs) {
-        for (auto& v : bins_) {
-            v += kDbfsOffset;
+    // Same method as SoundCurrent: each channel is analysed separately and "Mix" averages their power per bin, so
+    // phase differences between the channels cannot cancel detail before the FFT.
+    const bool wantLeft = settings_.channel != gram::ChannelMode::Right;
+    const bool wantRight = settings_.channel != gram::ChannelMode::Left;
+    std::vector<double> left;
+    std::vector<double> right;
+    if (wantLeft) {
+        if (!capture_->window(endFrame, settings_.fftSize, gram::ChannelMode::Left, samples_)) {
+            return false;
         }
+        plan_.compute_db(samples_.data(), left, -240.0, &profiling_);
+    }
+    if (wantRight) {
+        if (!capture_->window(endFrame, settings_.fftSize, gram::ChannelMode::Right, samples_)) {
+            return false;
+        }
+        plan_.compute_db(samples_.data(), right, -240.0, &profiling_);
+    }
+    const auto& first = wantLeft ? left : right;
+    bins_.resize(first.size());
+    const double n = settings_.fftSize;
+    const double gain = 4.0 * n / (n - 1.0); // Hann-window amplitude correction, as in SoundCurrent
+    for (std::size_t i = 0; i < bins_.size(); ++i) {
+        const bool edge = i == 0 || i + 1 == bins_.size();
+        const double offset = settings_.calibrateDbfs ? 20.0 * std::log10(edge ? gain / 2.0 : gain) : 0.0;
+        double power = 0.0;
+        int channels = 0;
+        if (wantLeft) {
+            power += std::pow(10.0, (left[i] + offset) / 10.0);
+            ++channels;
+        }
+        if (wantRight) {
+            power += std::pow(10.0, (right[i] + offset) / 10.0);
+            ++channels;
+        }
+        bins_[i] = 10.0 * std::log10(std::max(power / channels, 1.0e-24));
     }
     return true;
 }
