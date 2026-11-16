@@ -211,13 +211,52 @@ void SpectrogramView::updateCeiling() {
     }
 }
 
+// One display column from the dB bins: linear interpolation between bins at each row's centre, and the loudest bin
+// when several bins share a row, so narrow peaks stay visible and low rows are not blocky.
+std::vector<double> SpectrogramView::interpolatedColumn(const gram::SpectrogramSettings& core) const {
+    const int rows = core.image_height;
+    std::vector<double> column(static_cast<std::size_t>(rows), -240.0);
+    if (bins_.size() < 2 || rows < 1) {
+        return column;
+    }
+    const double nyquist = PcmCapture::kRate / 2.0;
+    const double lo = std::clamp(core.min_frequency, 0.0, nyquist);
+    const double hi = std::clamp(core.max_frequency, lo + 1.0, nyquist);
+    const double last = static_cast<double>(bins_.size() - 1);
+    const auto frequency = [&](double r) {
+        r = std::clamp(r, 0.0, 1.0);
+        if (core.frequency_scale == gram::FrequencyScale::Linear) {
+            return lo + r * (hi - lo);
+        }
+        const double base = std::max(lo, 1.0);
+        return base * std::pow(hi / base, r);
+    };
+    const auto binAt = [&](double r) { return std::clamp(frequency(r) * last / nyquist, 0.0, last); };
+    for (int y = 0; y < rows; ++y) {
+        const double r = rows == 1 ? 0.5 : static_cast<double>(rows - 1 - y) / (rows - 1);
+        const double a = binAt(r - 0.5 / rows);
+        const double b = binAt(r + 0.5 / rows);
+        const double center = binAt(r);
+        const auto first = static_cast<std::size_t>(center);
+        const auto next = std::min(first + 1, bins_.size() - 1);
+        double value = bins_[first] + (bins_[next] - bins_[first]) * (center - static_cast<double>(first));
+        if (b - a > 1.0) {
+            for (auto i = static_cast<std::size_t>(std::ceil(a)); i <= static_cast<std::size_t>(std::floor(b)); ++i) {
+                value = std::max(value, bins_[i]);
+            }
+        }
+        column[static_cast<std::size_t>(y)] = value;
+    }
+    return column;
+}
+
 void SpectrogramView::pushColumn(std::int64_t endFrame) {
     if (!computeBins(endFrame)) {
         return;
     }
     updateCeiling();
     const auto core = coreSettings();
-    auto column = gram::render_column(bins_, PcmCapture::kRate, core);
+    auto column = interpolatedColumn(core);
     gram::scroll_image_left(image_);
     gram::set_image_column(image_, image_.width - 1, column, core);
     history_.push_back(std::move(column));

@@ -83,6 +83,7 @@ private:
     void rerenderHistory();
     [[nodiscard]] gram::SpectrogramSettings coreSettings() const;
     bool computeBins(std::int64_t endFrame);
+    [[nodiscard]] std::vector<double> interpolatedColumn(const gram::SpectrogramSettings& core) const;
     void pushColumn(std::int64_t endFrame);
     void updateCeiling();
     void padStalls();
