@@ -131,6 +131,13 @@ int main(int argc, char** argv) {
     check(view.loadWav(path, &error) && view.fileMode(), "a WAV file renders");
     check(!view.loadWav(dir.filePath(QStringLiteral("missing.wav")), &error) && !error.isEmpty(), "a missing file reports an error");
 
+    // 8b. A restarted capture with no data must not be padded with the old wall-clock deficit.
+    capture.clear();
+    view.reset();
+    view.setMode(gramqt::ViewMode::Spectrogram);
+    view.advance();
+    check(capture.totalFrames() < gramqt::PcmCapture::kRate, "restarting the capture does not pad a stale deficit");
+
     // 9. The whole window builds and grabs.
     gramqt::StartupOptions options;
     options.noCapture = true;

@@ -97,6 +97,7 @@ private:
     bool fileMode_ = false;
     QImage fileImage_;
     double fileSeconds_ = 0.0;
+    double fileRate_ = PcmCapture::kRate;
     QString fileName_;
 
     gram::FftPlan plan_{4096};
@@ -115,6 +116,7 @@ private:
     gram::ProfilingStats profiling_;
     QElapsedTimer padClock_;
     std::int64_t padBase_ = 0;
+    std::int64_t padSeen_ = -1;
     QElapsedTimer spectrumClock_;
     QTimer timer_;
 };

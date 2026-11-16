@@ -70,7 +70,7 @@ double SpectrogramView::framesPerColumn() const {
 }
 
 double SpectrogramView::position(double frequency) const {
-    const double nyquist = PcmCapture::kRate / 2.0;
+    const double nyquist = (fileMode_ ? fileRate_ : PcmCapture::kRate) / 2.0;
     const double lo = std::clamp(settings_.minHz, 0.0, nyquist);
     const double hi = settings_.maxHz > 0.0 ? std::min(settings_.maxHz, nyquist) : nyquist;
     switch (settings_.scale) {
@@ -138,6 +138,8 @@ void SpectrogramView::setSettings(const ViewSettings& settings) {
                                  settings.calibrateDbfs != settings_.calibrateDbfs;
     const bool fftChanged = settings.fftSize != settings_.fftSize;
     settings_ = settings;
+    settings_.historySec = std::clamp(settings_.historySec, 2.0, 120.0);
+    settings_.sensitivityDb = std::clamp(settings_.sensitivityDb, 12.0, 200.0);
     settings_.minHz = std::clamp(settings_.minHz, 0.0, PcmCapture::kRate / 2.0 - 1.0);
     if (settings_.maxHz <= settings_.minHz) {
         settings_.maxHz = std::min(PcmCapture::kRate / 2.0, settings_.minHz + 1.0);
@@ -231,16 +233,22 @@ void SpectrogramView::padStalls() {
     if (!capture_ || !capture_->running()) {
         return;
     }
-    if (!padClock_.isValid()) {
-        padClock_.start();
-        padBase_ = capture_->totalFrames();
+    const auto total = capture_->totalFrames();
+    if (!padClock_.isValid() || total != padSeen_) {
+        // Real data arrived (or the capture restarted): re-anchor the wall clock to the sample clock.
+        padClock_.restart();
+        padBase_ = total;
+        padSeen_ = total;
         return;
     }
     const auto expected = padBase_ + static_cast<std::int64_t>(padClock_.nsecsElapsed() * PcmCapture::kRate / 1e9);
-    const auto deficit = expected - capture_->totalFrames();
+    const auto deficit = std::min<std::int64_t>(expected - total, PcmCapture::kCapacityFrames / 2);
     if (deficit > static_cast<std::int64_t>(kStallSeconds * PcmCapture::kRate) &&
         capture_->msSinceData() > static_cast<qint64>(kStallSeconds * 1000)) {
         capture_->padSilence(deficit);
+        padBase_ = capture_->totalFrames();
+        padSeen_ = padBase_;
+        padClock_.restart();
     }
 }
 
@@ -328,6 +336,7 @@ bool SpectrogramView::loadWav(const QString& path, QString* error) {
         const auto image = gram::render_full_spectrogram(mono, wav.sample_rate, core, &stats);
         fileImage_ = opaqueImage(image);
         fileSeconds_ = static_cast<double>(mono.size()) / wav.sample_rate;
+        fileRate_ = wav.sample_rate;
         fileName_ = path;
         fileMode_ = true;
         profiling_ = stats;
@@ -366,7 +375,7 @@ QString SpectrogramView::statusText() const {
 }
 
 std::vector<double> SpectrogramView::tickFrequencies() const {
-    const double nyquist = PcmCapture::kRate / 2.0;
+    const double nyquist = (fileMode_ ? fileRate_ : PcmCapture::kRate) / 2.0;
     const double lo = std::clamp(settings_.minHz, 0.0, nyquist);
     const double hi = settings_.maxHz > 0.0 ? std::min(settings_.maxHz, nyquist) : nyquist;
     std::vector<double> ticks;
