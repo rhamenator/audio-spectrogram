@@ -304,8 +304,8 @@ WavData load_wav(const std::string& path) {
     if (audio_format != 1) {
         fail("Only uncompressed PCM wave files are supported.");
     }
-    if (channels < 1 || channels > 2) {
-        fail("Only mono and stereo PCM wave files are supported.");
+    if (channels < 1 || channels > 32) {
+        fail("Only wave files with 1 to 32 channels are supported.");
     }
     if (bits_per_sample != 8 && bits_per_sample != 16) {
         fail("Only 8-bit and 16-bit PCM wave files are supported.");
@@ -313,11 +313,12 @@ WavData load_wav(const std::string& path) {
 
     WavData wav;
     wav.sample_rate = static_cast<int>(sample_rate);
-    wav.channels = static_cast<int>(channels);
+    const int source_channels = static_cast<int>(channels);
+    wav.channels = std::min(source_channels, 2);
     wav.bits_per_sample = static_cast<int>(bits_per_sample);
 
     const int bytes_per_sample = bits_per_sample / 8;
-    const int frame_size = bytes_per_sample * wav.channels;
+    const int frame_size = bytes_per_sample * source_channels;
     if (raw_data.size() % static_cast<std::size_t>(frame_size) != 0) {
         fail("Wave data size is not aligned to sample frames.");
     }
@@ -325,9 +326,43 @@ WavData load_wav(const std::string& path) {
     const auto frame_count = raw_data.size() / static_cast<std::size_t>(frame_size);
     wav.samples.resize(frame_count * static_cast<std::size_t>(wav.channels));
 
+    // Channels beyond stereo are mixed down to left/right. Six and eight channel files use the
+    // standard WAV order (FL FR FC LFE BL BR [SL SR]): centre and surrounds are folded in at -3 dB
+    // and the LFE is dropped. Any other layout alternates left/right. Each side is normalized by
+    // the sum of its weights so the mix cannot clip.
+    std::vector<double> left_weight(static_cast<std::size_t>(source_channels), 0.0);
+    std::vector<double> right_weight(static_cast<std::size_t>(source_channels), 0.0);
+    constexpr double kFold = 0.7071067811865476;
+    if (source_channels <= 2) {
+        left_weight[0] = 1.0;
+        right_weight[static_cast<std::size_t>(source_channels - 1)] = 1.0;
+    } else if (source_channels == 6 || source_channels == 8) {
+        left_weight[0] = 1.0;
+        right_weight[1] = 1.0;
+        left_weight[2] = kFold;
+        right_weight[2] = kFold;
+        left_weight[4] = kFold;
+        right_weight[5] = kFold;
+        if (source_channels == 8) {
+            left_weight[6] = kFold;
+            right_weight[7] = kFold;
+        }
+    } else {
+        for (int channel = 0; channel < source_channels; ++channel) {
+            (channel % 2 == 0 ? left_weight : right_weight)[static_cast<std::size_t>(channel)] = 1.0;
+        }
+    }
+    double left_total = 0.0;
+    double right_total = 0.0;
+    for (int channel = 0; channel < source_channels; ++channel) {
+        left_total += left_weight[static_cast<std::size_t>(channel)];
+        right_total += right_weight[static_cast<std::size_t>(channel)];
+    }
+
+    std::vector<double> frame_samples(static_cast<std::size_t>(source_channels));
     std::size_t cursor = 0;
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
-        for (int channel = 0; channel < wav.channels; ++channel) {
+        for (int channel = 0; channel < source_channels; ++channel) {
             double sample = 0.0;
             if (bits_per_sample == 8) {
                 sample = (static_cast<int>(raw_data[cursor++]) - 128) / 128.0;
@@ -337,8 +372,22 @@ WavData load_wav(const std::string& path) {
                 cursor += 2;
                 sample = std::clamp(static_cast<double>(value) / 32768.0, -1.0, 1.0);
             }
-            wav.samples[frame * static_cast<std::size_t>(wav.channels) +
-                static_cast<std::size_t>(channel)] = sample;
+            frame_samples[static_cast<std::size_t>(channel)] = sample;
+        }
+        if (source_channels <= 2) {
+            for (int channel = 0; channel < source_channels; ++channel) {
+                wav.samples[frame * static_cast<std::size_t>(wav.channels) +
+                    static_cast<std::size_t>(channel)] = frame_samples[static_cast<std::size_t>(channel)];
+            }
+        } else {
+            double left = 0.0;
+            double right = 0.0;
+            for (int channel = 0; channel < source_channels; ++channel) {
+                left += left_weight[static_cast<std::size_t>(channel)] * frame_samples[static_cast<std::size_t>(channel)];
+                right += right_weight[static_cast<std::size_t>(channel)] * frame_samples[static_cast<std::size_t>(channel)];
+            }
+            wav.samples[frame * 2] = left / left_total;
+            wav.samples[frame * 2 + 1] = right / right_total;
         }
     }
 
