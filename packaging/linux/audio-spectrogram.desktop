@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Audio Spectrogram
+GenericName=Spectrogram
+Comment=Live spectrogram of the audio you are playing, or of a WAV file
+Exec=audio-spectrogram
+Icon=audio-spectrogram
+Terminal=false
+Categories=AudioVideo;Audio;Player;Science;
+Keywords=spectrogram;spectrum;audio;fft;analyzer;
+StartupWMClass=audio-spectrogram
